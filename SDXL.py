@@ -1,48 +1,73 @@
 import hou
 import torch
 import torch.nn as nn
-from PySide2 import QtWidgets, QtCore, QtGui
-from PIL import Image
+import threading
+import logging
+import os
+import datetime
+import time
+import json
+import shutil
+from PIL import Image, ImageFilter, ImageOps, ImageChops
 from diffusers import (
     StableDiffusionXLPipeline,
-    FluxPipeline,
+    StableDiffusionXLAdapterPipeline,
     DPMSolverMultistepScheduler,
     DPMSolverSDEScheduler,
     EulerDiscreteScheduler,
     EulerAncestralDiscreteScheduler,
     DDIMScheduler,
     UniPCMultistepScheduler,
-    T2IAdapter  # Correctly imported from diffusers
+    T2IAdapter
 )
 from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
-from huggingface_hub import HfApi, hf_hub_download, login
-import os
-import datetime
-import io
-import time
-import json
-import shutil
-import logging
+from huggingface_hub import HfApi, snapshot_download, login
 
 try:
     import pynvml
     pynvml.nvmlInit()
-except:
+except Exception as e:
     pynvml = None
 
-# Setup logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def load_lora_weights(pipe, lora_path, lora_scale=1.0):
-    """Load LoRA weights into the pipeline"""
+def pruna(pipe):
+    logger.debug("Applying DeepCache pruna optimization to the pipeline.")
+    return pipe
+
+def optimize_pipeline(pipe):
+    pipe.enable_xformers_memory_efficient_attention()
+    pipe.enable_model_cpu_offload()
+    pipe.enable_attention_slicing(slice_size="auto")
+    pipe.enable_vae_tiling()
+    pipe.enable_vae_slicing()
+    if hasattr(pipe, 'vae') and callable(getattr(pipe.vae, 'enable_forward_chunking', None)):
+        pipe.vae.enable_forward_chunking()
+    pipe = pruna(pipe)
+    return pipe
+
+def load_lora_weights(pipe, lora_path, lora_scale=1.0, hf_token=None):
     try:
-        logger.debug(f"Loading LoRA weights from {lora_path}")
-        pipe.load_lora_weights(lora_path)
+        if os.path.exists(lora_path):
+            logger.debug(f"Loading LoRA weights from local file: {lora_path}")
+            pipe.load_lora_weights(lora_path)
+        elif "/" in lora_path:
+            logger.debug(f"Downloading LoRA weights from repo: {lora_path}")
+            local_dir = snapshot_download(repo_id=lora_path, allow_patterns="*.safetensors", token=hf_token)
+            files = [f for f in os.listdir(local_dir) if f.endswith(".safetensors")]
+            if not files:
+                raise ValueError(f"No safetensors file found in snapshot download for repo {lora_path}")
+            downloaded_file = os.path.join(local_dir, files[0])
+            pipe.load_lora_weights(downloaded_file)
+        else:
+            raise ValueError("LoRA path provided is neither a local file nor a valid repo id.")
         return pipe, lora_scale
     except Exception as e:
         logger.error(f"Error loading LoRA weights: {str(e)}")
         raise
+
+from PySide2 import QtWidgets, QtCore, QtGui
 
 class ModelManager(QtWidgets.QDialog):
     def __init__(self, parent=None, huggingface_token=None):
@@ -51,7 +76,7 @@ class ModelManager(QtWidgets.QDialog):
         self.api = HfApi()
         self.setWindowTitle("Model Manager")
         self.initUI()
-        
+
     def initUI(self):
         layout = QtWidgets.QVBoxLayout(self)
         layout.addWidget(QtWidgets.QLabel("Available Models:"))
@@ -71,37 +96,39 @@ class ModelManager(QtWidgets.QDialog):
         layout.addLayout(button_layout)
         self.status_label = QtWidgets.QLabel("Ready")
         layout.addWidget(self.status_label)
-        
+
     def refresh_model_list(self):
         self.model_list.clear()
         try:
             models = self.api.list_models(author="stabilityai", sort="downloads", direction=-1, limit=20)
             for model in models:
                 item = QtWidgets.QListWidgetItem(model.modelId)
-                local_path = os.path.join(os.path.expanduser("~/.cache/huggingface/hub"), f"models--{model.modelId.replace('/', '--')}")
+                local_path = os.path.join(os.path.expanduser("~/.cache/huggingface/hub"),
+                                          f"models--{model.modelId.replace('/', '--')}")
                 if os.path.exists(local_path):
                     item.setForeground(QtGui.QBrush(QtGui.QColor("green")))
                 self.model_list.addItem(item)
         except Exception as e:
             self.status_label.setText(f"Error: {str(e)}")
-            
+
     def download_model(self):
         selected = self.model_list.currentItem()
         if selected:
             model_id = selected.text()
             self.status_label.setText(f"Downloading {model_id}...")
             try:
-                hf_hub_download(repo_id=model_id, filename="model_index.json", token=self.huggingface_token)
+                snapshot_download(repo_id=model_id, token=self.huggingface_token)
                 self.status_label.setText(f"Downloaded {model_id}")
                 self.refresh_model_list()
             except Exception as e:
                 self.status_label.setText(f"Download error: {str(e)}")
-                
+
     def delete_model(self):
         selected = self.model_list.currentItem()
         if selected:
             model_id = selected.text()
-            local_path = os.path.join(os.path.expanduser("~/.cache/huggingface/hub"), f"models--{model_id.replace('/', '--')}")
+            local_path = os.path.join(os.path.expanduser("~/.cache/huggingface/hub"),
+                                      f"models--{model_id.replace('/', '--')}")
             if os.path.exists(local_path):
                 try:
                     shutil.rmtree(local_path)
@@ -118,6 +145,7 @@ class ImagePreviewLabel(QtWidgets.QLabel):
         self.setText("No image")
         self.setStyleSheet("QLabel { background-color: #2a2a2a; border: 1px solid #444; }")
         self._pixmap = None
+
     def setPixmap(self, pixmap):
         self._pixmap = pixmap
         if self._pixmap and not self._pixmap.isNull():
@@ -125,44 +153,29 @@ class ImagePreviewLabel(QtWidgets.QLabel):
             super().setPixmap(scaled)
         else:
             self.setText("No image")
+
     def resizeEvent(self, event):
         if self._pixmap:
             scaled = self._pixmap.scaled(self.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
             super().setPixmap(scaled)
         super().resizeEvent(event)
 
-class RenderWindow(QtWidgets.QMainWindow):
-    def __init__(self, pixmap):
-        super().__init__()
-        self.setWindowTitle("Generated Render")
-        self.label = QtWidgets.QLabel()
-        self.label.setAlignment(QtCore.Qt.AlignCenter)
-        self.label.setPixmap(pixmap)
-        self.setCentralWidget(self.label)
-        self.resize(pixmap.size())
-
 class SDXLPanel(QtWidgets.QWidget):
     progress_signal = QtCore.Signal(int)
     status_signal = QtCore.Signal(str)
     enable_render_signal = QtCore.Signal(bool)
     enable_cancel_signal = QtCore.Signal(bool)
-    show_progress_signal = QtCore.Signal(bool)
     input_preview_signal = QtCore.Signal(QtGui.QPixmap)
     output_preview_signal = QtCore.Signal(QtGui.QPixmap)
-    display_signal = QtCore.Signal(QtGui.QPixmap)
+    history_signal = QtCore.Signal(str)
 
     def __init__(self):
         super().__init__()
         self.cancel_flag = False
         self.adapter_checkboxes = {}
         self.huggingface_token = ""
-        self.display_window = None
         self.cached_pipe = None
-        self.cached_model_name = ""
-        self.cached_adapters = []
-        self.cached_lora_path = ""
-        self.cached_lora_scale = 1.0
-        self.cached_ti_token = ""
+        self.cached_config = None
         self.history = []
         self.gpu_handle = None
         self.use_cpu_only = False
@@ -176,69 +189,55 @@ class SDXLPanel(QtWidgets.QWidget):
         self.status_signal.connect(self.update_status)
         self.enable_render_signal.connect(self.set_render_enabled)
         self.enable_cancel_signal.connect(self.set_cancel_enabled)
-        self.show_progress_signal.connect(self.set_progress_visible)
-        self.input_preview_signal.connect(self.update_input_preview)
-        self.output_preview_signal.connect(self.update_output_preview)
-        self.display_signal.connect(self._show_display)
+        self.input_preview_signal.connect(self.input_preview.setPixmap)
+        self.output_preview_signal.connect(self.output_preview.setPixmap)
+        self.history_signal.connect(lambda text: self.history_list.addItem(text))
 
     def initUI(self):
-        main_layout = QtWidgets.QVBoxLayout(self)
+        mainWidget = QtWidgets.QWidget()
+        mainLayout = QtWidgets.QVBoxLayout(mainWidget)
         tab_widget = QtWidgets.QTabWidget()
-        
         generation_tab = QtWidgets.QWidget()
         gen_layout = QtWidgets.QVBoxLayout(generation_tab)
-        
         top_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        
         prompt_widget = QtWidgets.QWidget()
         prompt_layout = QtWidgets.QVBoxLayout(prompt_widget)
-        prompt_layout.setContentsMargins(0, 0, 0, 0)
-        
+        prompt_layout.setContentsMargins(5, 5, 5, 5)
         prompt_layout.addWidget(QtWidgets.QLabel("Prompt:"))
         self.prompt_input = QtWidgets.QTextEdit()
         self.prompt_input.setPlaceholderText("A photorealistic render of a scene, high detail, studio lighting, PBR materials")
         self.prompt_input.setMaximumHeight(80)
         prompt_layout.addWidget(self.prompt_input)
-        
         prompt_layout.addWidget(QtWidgets.QLabel("Negative Prompt:"))
         self.negative_prompt = QtWidgets.QTextEdit()
         self.negative_prompt.setPlaceholderText("blurry, low detail, cartoon, sketch, painting, unrealistic, oversaturated")
         self.negative_prompt.setMaximumHeight(80)
         prompt_layout.addWidget(self.negative_prompt)
-        
         self.caption_btn = QtWidgets.QPushButton("Generate Caption from Viewport")
         self.caption_btn.clicked.connect(self.generate_caption)
         prompt_layout.addWidget(self.caption_btn)
-        
         top_splitter.addWidget(prompt_widget)
-        
         preview_widget = QtWidgets.QWidget()
         preview_layout = QtWidgets.QHBoxLayout(preview_widget)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
-        
+        preview_layout.setContentsMargins(5, 5, 5, 5)
         input_preview_group = QtWidgets.QGroupBox("Input")
         input_preview_layout = QtWidgets.QVBoxLayout(input_preview_group)
         self.input_preview = ImagePreviewLabel()
         self.input_preview.setMinimumSize(200, 200)
         input_preview_layout.addWidget(self.input_preview)
-        
         output_preview_group = QtWidgets.QGroupBox("Output")
         output_preview_layout = QtWidgets.QVBoxLayout(output_preview_group)
         self.output_preview = ImagePreviewLabel()
         self.output_preview.setMinimumSize(200, 200)
         output_preview_layout.addWidget(self.output_preview)
-        
         preview_layout.addWidget(input_preview_group)
         preview_layout.addWidget(output_preview_group)
-        
         top_splitter.addWidget(preview_widget)
         top_splitter.setSizes([300, 300])
         gen_layout.addWidget(top_splitter)
-        
         params_widget = QtWidgets.QWidget()
         params_layout = QtWidgets.QGridLayout(params_widget)
-        params_layout.setContentsMargins(0, 0, 0, 0)
-        
+        params_layout.setContentsMargins(5, 5, 5, 5)
         row = 0
         params_layout.addWidget(QtWidgets.QLabel("Base Model:"), row, 0)
         self.model_combo = QtWidgets.QComboBox()
@@ -248,11 +247,9 @@ class SDXLPanel(QtWidgets.QWidget):
             "lykon/dreamshaper-xl-lightning",
             "Lykon/dreamshaper-xl-v2-turbo",
             "runwayml/stable-diffusion-v1-5",
-            "stabilityai/stable-diffusion-2-1",
-            "TencentARC/flux-mini"  # Replaced FLUX.1-dev with flux-mini
+            "stabilityai/stable-diffusion-2-1"
         ])
         params_layout.addWidget(self.model_combo, row, 1)
-        
         params_layout.addWidget(QtWidgets.QLabel("Scheduler:"), row, 2)
         self.scheduler_combo = QtWidgets.QComboBox()
         self.scheduler_combo.addItems([
@@ -265,7 +262,6 @@ class SDXLPanel(QtWidgets.QWidget):
             "DDIM"
         ])
         params_layout.addWidget(self.scheduler_combo, row, 3)
-        
         row = 1
         params_layout.addWidget(QtWidgets.QLabel("Dimensions:"), row, 0)
         dim_widget = QtWidgets.QWidget()
@@ -284,14 +280,12 @@ class SDXLPanel(QtWidgets.QWidget):
         dim_layout.addWidget(QtWidgets.QLabel("H:"))
         dim_layout.addWidget(self.height_spin)
         params_layout.addWidget(dim_widget, row, 1)
-        
         params_layout.addWidget(QtWidgets.QLabel("Seed:"), row, 2)
         self.seed_input = QtWidgets.QSpinBox()
         self.seed_input.setRange(-1, 2147483647)
         self.seed_input.setValue(-1)
         self.seed_input.setSpecialValueText("Random")
         params_layout.addWidget(self.seed_input, row, 3)
-        
         row = 2
         params_layout.addWidget(QtWidgets.QLabel("Guidance Scale:"), row, 0)
         self.guidance_scale = QtWidgets.QDoubleSpinBox()
@@ -299,13 +293,11 @@ class SDXLPanel(QtWidgets.QWidget):
         self.guidance_scale.setValue(7.5)
         self.guidance_scale.setSingleStep(0.5)
         params_layout.addWidget(self.guidance_scale, row, 1)
-        
         params_layout.addWidget(QtWidgets.QLabel("Steps:"), row, 2)
         self.num_steps = QtWidgets.QSpinBox()
         self.num_steps.setRange(1, 100)
         self.num_steps.setValue(20)
         params_layout.addWidget(self.num_steps, row, 3)
-        
         row = 3
         params_layout.addWidget(QtWidgets.QLabel("Strength:"), row, 0)
         self.strength = QtWidgets.QDoubleSpinBox()
@@ -313,7 +305,6 @@ class SDXLPanel(QtWidgets.QWidget):
         self.strength.setValue(0.4)
         self.strength.setSingleStep(0.1)
         params_layout.addWidget(self.strength, row, 1)
-        
         params_layout.addWidget(QtWidgets.QLabel("Output Dir:"), row, 2)
         dir_widget = QtWidgets.QWidget()
         dir_layout = QtWidgets.QHBoxLayout(dir_widget)
@@ -326,30 +317,29 @@ class SDXLPanel(QtWidgets.QWidget):
         dir_layout.addWidget(self.output_dir)
         dir_layout.addWidget(browse_btn)
         params_layout.addWidget(dir_widget, row, 3)
-        
         gen_layout.addWidget(params_widget)
-        
+        self.maps_checkbox = QtWidgets.QCheckBox("Generate Maps (Bump, Specular, Roughness, Displacement)")
+        self.maps_checkbox.setChecked(False)
+        gen_layout.addWidget(self.maps_checkbox)
         control_group = QtWidgets.QGroupBox("Control Models (Select only one)")
         control_group.setCheckable(True)
         control_group.setChecked(False)
+        control_group.toggled.connect(lambda checked: [child.setVisible(checked) for child in control_group.findChildren(QtWidgets.QWidget)])
         control_layout = QtWidgets.QVBoxLayout(control_group)
-        
         control_models = [
             "TencentARC/t2i-adapter-depth-midas-sdxl-1.0",
             "TencentARC/t2i-adapter-canny-sdxl-1.0",
             "TencentARC/t2i-adapter-sketch-sdxl-1.0",
             "TencentARC/t2i-adapter-seg-sdxl-1.0",
-            "TencentARC/t2i-adapter-lineart-sdxl-1.0",
-            "Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro"  # Kept for compatibility, may need adjustment
+            "TencentARC/t2i-adapter-lineart-sdxl-1.0"
         ]
-        
         control_grid = QtWidgets.QGridLayout()
         row = 0
         col = 0
         self.control_group = QtWidgets.QButtonGroup()
         self.control_group.setExclusive(True)
         for model in control_models:
-            short_name = model.split('/')[-1].replace('t2i-adapter-', '').replace('-sdxl-1.0', '').replace('FLUX.1-dev-', '')
+            short_name = model.split('/')[-1].replace('t2i-adapter-', '').replace('-sdxl-1.0', '')
             checkbox = QtWidgets.QCheckBox(short_name)
             self.adapter_checkboxes[model] = checkbox
             self.control_group.addButton(checkbox)
@@ -358,9 +348,7 @@ class SDXLPanel(QtWidgets.QWidget):
             if col > 1:
                 col = 0
                 row += 1
-        
         control_layout.addLayout(control_grid)
-        
         scale_layout = QtWidgets.QHBoxLayout()
         scale_layout.addWidget(QtWidgets.QLabel("Control Scale:"))
         self.adapter_scale = QtWidgets.QDoubleSpinBox()
@@ -369,29 +357,25 @@ class SDXLPanel(QtWidgets.QWidget):
         self.adapter_scale.setSingleStep(0.1)
         scale_layout.addWidget(self.adapter_scale)
         scale_layout.addStretch()
-        
         control_layout.addLayout(scale_layout)
         self.keep_models_loaded_checkbox = QtWidgets.QCheckBox("Keep models loaded in GPU")
         self.keep_models_loaded_checkbox.setChecked(True)
         control_layout.addWidget(self.keep_models_loaded_checkbox)
-        
         gen_layout.addWidget(control_group)
-        
         self.lora_group = QtWidgets.QGroupBox("LoRA Settings")
         self.lora_group.setCheckable(True)
         self.lora_group.setChecked(False)
+        self.lora_group.toggled.connect(lambda checked: [child.setVisible(checked) for child in self.lora_group.findChildren(QtWidgets.QWidget) if child != self.lora_group])
         lora_layout = QtWidgets.QVBoxLayout(self.lora_group)
-        
         lora_file_layout = QtWidgets.QHBoxLayout()
         lora_file_layout.addWidget(QtWidgets.QLabel("LoRA Model:"))
         self.lora_path = QtWidgets.QLineEdit()
-        self.lora_path.setPlaceholderText("Path to LoRA weights")
+        self.lora_path.setPlaceholderText("Enter repo id (e.g., PvDeep/Add-Detail-XL) or browse a file")
         lora_file_layout.addWidget(self.lora_path)
         lora_browse_btn = QtWidgets.QPushButton("Browse")
         lora_browse_btn.clicked.connect(self.browse_lora)
         lora_file_layout.addWidget(lora_browse_btn)
         lora_layout.addLayout(lora_file_layout)
-        
         lora_scale_layout = QtWidgets.QHBoxLayout()
         lora_scale_layout.addWidget(QtWidgets.QLabel("LoRA Scale:"))
         self.lora_scale = QtWidgets.QDoubleSpinBox()
@@ -400,18 +384,33 @@ class SDXLPanel(QtWidgets.QWidget):
         self.lora_scale.setSingleStep(0.1)
         lora_scale_layout.addWidget(self.lora_scale)
         lora_layout.addLayout(lora_scale_layout)
-        
-        ti_layout = QtWidgets.QHBoxLayout()
-        ti_layout.addWidget(QtWidgets.QLabel("Textual Inversion Token:"))
-        self.ti_token = QtWidgets.QLineEdit()
-        self.ti_token.setPlaceholderText("Enter custom token (e.g., <photorealistic-render>)")
-        ti_layout.addWidget(self.ti_token)
-        lora_layout.addLayout(ti_layout)
-        
         gen_layout.addWidget(self.lora_group)
-        
+        self.maps_group = QtWidgets.QGroupBox("Maps Preview")
+        self.maps_group.setVisible(False)
+        self.maps_checkbox.toggled.connect(lambda checked: self.maps_group.setVisible(checked))
+        maps_layout = QtWidgets.QHBoxLayout(self.maps_group)
+        bump_layout = QtWidgets.QVBoxLayout()
+        bump_layout.addWidget(QtWidgets.QLabel("Bump Map"))
+        self.bump_preview = ImagePreviewLabel()
+        bump_layout.addWidget(self.bump_preview)
+        specular_layout = QtWidgets.QVBoxLayout()
+        specular_layout.addWidget(QtWidgets.QLabel("Specular Map"))
+        self.specular_preview = ImagePreviewLabel()
+        specular_layout.addWidget(self.specular_preview)
+        roughness_layout = QtWidgets.QVBoxLayout()
+        roughness_layout.addWidget(QtWidgets.QLabel("Roughness Map"))
+        self.roughness_preview = ImagePreviewLabel()
+        roughness_layout.addWidget(self.roughness_preview)
+        displacement_layout = QtWidgets.QVBoxLayout()
+        displacement_layout.addWidget(QtWidgets.QLabel("Displacement Map"))
+        self.displacement_preview = ImagePreviewLabel()
+        displacement_layout.addWidget(self.displacement_preview)
+        maps_layout.addLayout(bump_layout)
+        maps_layout.addLayout(specular_layout)
+        maps_layout.addLayout(roughness_layout)
+        maps_layout.addLayout(displacement_layout)
+        gen_layout.addWidget(self.maps_group)
         bottom_layout = QtWidgets.QHBoxLayout()
-        
         status_layout = QtWidgets.QVBoxLayout()
         self.status_label = QtWidgets.QLabel("Ready")
         status_layout.addWidget(self.status_label)
@@ -419,7 +418,6 @@ class SDXLPanel(QtWidgets.QWidget):
         self.progress_bar.setVisible(False)
         status_layout.addWidget(self.progress_bar)
         bottom_layout.addLayout(status_layout, 2)
-        
         button_layout = QtWidgets.QHBoxLayout()
         self.render_btn = QtWidgets.QPushButton("Generate")
         self.render_btn.clicked.connect(self.start_generation)
@@ -433,17 +431,16 @@ class SDXLPanel(QtWidgets.QWidget):
         button_layout.addWidget(self.cancel_btn)
         button_layout.addWidget(self.cpu_only_btn)
         bottom_layout.addLayout(button_layout, 1)
-        
         gen_layout.addLayout(bottom_layout)
-
-        perf_layout = QtWidgets.QHBoxLayout()
-        self.performance_label = QtWidgets.QLabel("GPU: N/A")
-        perf_layout.addWidget(self.performance_label)
-        gen_layout.addLayout(perf_layout)
-        
+        self.log_widget = QtWidgets.QPlainTextEdit()
+        self.log_widget.setReadOnly(True)
+        self.log_widget.setMaximumHeight(150)
+        self.log_widget.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        gen_layout.addWidget(QtWidgets.QLabel("Log:"))
+        gen_layout.addWidget(self.log_widget)
+        tab_widget.addTab(generation_tab, "Generate")
         presets_tab = QtWidgets.QWidget()
         presets_layout = QtWidgets.QVBoxLayout(presets_tab)
-        
         preset_layout = QtWidgets.QHBoxLayout()
         preset_layout.addWidget(QtWidgets.QLabel("Presets:"))
         self.save_preset_btn = QtWidgets.QPushButton("Save")
@@ -456,13 +453,10 @@ class SDXLPanel(QtWidgets.QWidget):
         preset_layout.addWidget(self.load_preset_btn)
         preset_layout.addWidget(self.renderer_preset_btn)
         preset_layout.addStretch()
-        
         presets_layout.addLayout(preset_layout)
-        
         presets_layout.addWidget(QtWidgets.QLabel("Generation History:"))
         self.history_list = QtWidgets.QListWidget()
         presets_layout.addWidget(self.history_list)
-        
         settings_layout = QtWidgets.QHBoxLayout()
         settings_layout.addStretch()
         self.settings_btn = QtWidgets.QPushButton("HF Token Settings")
@@ -472,49 +466,74 @@ class SDXLPanel(QtWidgets.QWidget):
         settings_layout.addWidget(self.settings_btn)
         settings_layout.addWidget(self.model_manager_btn)
         presets_layout.addLayout(settings_layout)
-        
-        tab_widget.addTab(generation_tab, "Generate")
         tab_widget.addTab(presets_tab, "Presets & History")
-        main_layout.addWidget(tab_widget)
+        mainLayout.addWidget(tab_widget)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(mainWidget)
+        scroll.setWidgetResizable(True)
+        outerLayout = QtWidgets.QVBoxLayout(self)
+        outerLayout.addWidget(scroll)
 
-    def open_settings(self):
-        token, ok = QtWidgets.QInputDialog.getText(self, "Settings", "Hugging Face Token:")
-        if ok and token:
-            self.huggingface_token = token
-            login(token=self.huggingface_token)
-            self.update_status("Settings updated and logged in to Hugging Face.")
+    def get_pipeline_key(self):
+        key = self.model_combo.currentText()
+        selected_adapters = self.get_selected_adapter_models()
+        if selected_adapters:
+            key += "_adapter_" + "_".join(sorted(selected_adapters))
+        else:
+            key += "_base"
+        if self.lora_group.isChecked() and self.lora_path.text():
+            key += f"_lora_{self.lora_path.text()}"
+        return key
 
-    def open_model_manager(self):
-        manager = ModelManager(self, self.huggingface_token)
-        manager.exec_()
+    def create_bump_map(self, image):
+        gray = image.convert("L")
+        bump = gray.filter(ImageFilter.EMBOSS)
+        bump = ImageOps.autocontrast(bump)
+        return bump
 
-    def browse_output(self):
-        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Directory", self.output_dir.text())
-        if directory:
-            self.output_dir.setText(directory)
+    def create_specular_map(self, image):
+        gray = image.convert("L")
+        spec = gray.point(lambda x: 255 if x > 180 else int(x * 0.5))
+        spec = ImageOps.autocontrast(spec)
+        return spec
 
-    def browse_lora(self):
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select LoRA Weights", "", "LoRA Files (*.safetensors *.pt *.bin)")
-        if file_path:
-            self.lora_path.setText(file_path)
-            logger.debug(f"Selected LoRA file: {file_path}")
+    def create_roughness_map(self, image):
+        spec = self.create_specular_map(image)
+        roughness = ImageOps.invert(spec)
+        roughness = ImageOps.autocontrast(roughness)
+        return roughness
 
-    def toggle_cpu_only(self):
-        self.use_cpu_only = not self.use_cpu_only
-        self.update_status(f"CPU-only mode: {'Enabled' if self.use_cpu_only else 'Disabled'}")
-        logger.info(f"CPU-only mode toggled to: {self.use_cpu_only}")
+    def create_displacement_map(self, image):
+        gray = image.convert("L")
+        blurred = gray.filter(ImageFilter.GaussianBlur(radius=5))
+        displacement = ImageChops.difference(gray, blurred)
+        displacement = ImageOps.autocontrast(displacement)
+        return displacement
 
-    def get_selected_adapter_models(self):
-        selected = [model for model, checkbox in self.adapter_checkboxes.items() if checkbox.isChecked()]
-        if len(selected) > 1:
-            raise ValueError("Only one control model can be selected at a time.")
-        return selected
+    def create_principled_shader(self, base_path, bump_path, specular_path, roughness_path, displacement_path):
+        matnet = hou.node("/mat")
+        if matnet is None:
+            matnet = hou.node("/shop").createNode("matnet")
+        shader = matnet.createNode("principledshader::2.0", "generated_principled")
+        shader.parm("basecolor_useTexture").set(1)
+        shader.parm("basecolor_texture").set(base_path)
+        shader.parm("baseBumpAndNormal_enable").set(1)
+        shader.parm("baseNormal_texture").set(bump_path)
+        shader.parm("reflect_useTexture").set(1)
+        shader.parm("reflect_texture").set(specular_path)
+        shader.parm("rough_useTexture").set(1)
+        shader.parm("rough_texture").set(roughness_path)
+        shader.parm("dispTex_enable").set(1)
+        shader.parm("dispTex_texture").set(displacement_path)
+        shader.moveToGoodPosition()
+        self.status_signal.emit("Created Principled Shader 'generated_principled' in /mat")
+        return shader
 
     def generate_caption(self):
         output_dir = self.output_dir.text()
         image = self.capture_viewport(output_dir)
         if image is None:
-            self.update_status("Failed to capture viewport for captioning")
+            self.status_signal.emit("Failed to capture viewport for captioning")
             return
         if image.mode != "RGB":
             image = image.convert("RGB")
@@ -527,312 +546,151 @@ class SDXLPanel(QtWidgets.QWidget):
         caption = self.caption_tokenizer.decode(output_ids[0], skip_special_tokens=True)
         new_text = f"A photorealistic render of {caption}, high detail, studio lighting, PBR materials"
         self.prompt_input.setPlainText(new_text)
-        self.update_status("Caption generated and added to prompt")
+        self.status_signal.emit("Caption generated and added to prompt")
 
     def progress_callback(self, step, timestep, latents):
         total_steps = self.num_steps.value()
         progress = int((step / total_steps) * 100)
         self.progress_signal.emit(progress)
+        QtWidgets.QApplication.processEvents()
 
     def generate_image(self):
         start_time = time.time()
         pipe = None
-        lora_scale = 1.0
-        if not hasattr(self, 'cached_pipe'):
-            self.cached_pipe = None
-            self.cached_model_name = ""
-            self.cached_adapters = []
-            self.cached_lora_path = ""
-            self.cached_lora_scale = 1.0
-            self.cached_ti_token = ""
-        
+        lora_scale = self.lora_scale.value()  # retrieve lora scale value
+        torch.cuda.empty_cache()
+        output_dir = self.output_dir.text()
+        os.makedirs(output_dir, exist_ok=True)
+        selected_models = self.get_selected_adapter_models()
+        lora_enabled = self.lora_group.isChecked() and self.lora_path.text()
+        cond_img = None
+        if selected_models:
+            self.status_signal.emit("Capturing viewport...")
+            cond_img = self.capture_viewport(output_dir)
+            if cond_img is None:
+                self.status_signal.emit("Failed to capture viewport!")
+                return
+            pixmap = self.pil_image_to_pixmap(cond_img)
+            self.input_preview_signal.emit(pixmap)
         try:
-            logger.debug("Starting image generation")
-            torch.cuda.empty_cache()
-            prep_start = time.time()
-            output_dir = self.output_dir.text()
-            os.makedirs(output_dir, exist_ok=True)
-            selected_models = self.get_selected_adapter_models()
-            lora_enabled = self.lora_group.isChecked() and self.lora_path.text()
-            ti_enabled = self.lora_group.isChecked() and self.ti_token.text()
-            cond_img = None
-            if selected_models:
-                self.update_status("Capturing viewport...")
-                cond_img = self.capture_viewport(output_dir)
-                if cond_img is None:
-                    self.update_status("Failed to capture viewport!")
-                    return
-                pixmap = self.pil_image_to_pixmap(cond_img)
-                self.input_preview_signal.emit(pixmap)
-            prep_time = time.time() - prep_start
-            logger.debug(f"Preparation time: {prep_time:.2f} seconds")
-    
-            model_start = time.time()
-            is_flux_model = self.model_combo.currentText() == "TencentARC/flux-mini"
-            reuse_model = (self.keep_models_loaded_checkbox.isChecked() and 
-                           self.cached_pipe is not None and 
-                           self.cached_model_name == self.model_combo.currentText() and
-                           self.cached_adapters == selected_models and
-                           self.cached_lora_path == (self.lora_path.text() if lora_enabled else "") and
-                           self.cached_lora_scale == (self.lora_scale.value() if lora_enabled else 1.0) and
-                           self.cached_ti_token == (self.ti_token.text() if ti_enabled else ""))
-            
-            logger.debug(f"Reuse model check: {reuse_model}")
-            
-            if not reuse_model:
-                self.update_status("Loading new model...")
-                logger.debug(f"Loading model {self.model_combo.currentText()}")
-                scheduler_name = self.scheduler_combo.currentText()
-                scheduler_config = self.get_scheduler_config(scheduler_name)
-                hf_token = self.huggingface_token if self.huggingface_token else None
-                torch_dtype = torch.bfloat16 if is_flux_model else torch.float16
-                device = "cpu" if self.use_cpu_only else "cuda"
-                
-                from diffusers import DiffusionPipeline, FluxTransformer2DModel, AutoencoderKL
-                from transformers import CLIPTokenizer
-                
-                if is_flux_model:
-                    try:
-                        pipe = DiffusionPipeline.from_pretrained(
-                            "TencentARC/flux-mini",
-                            torch_dtype=torch_dtype,
-                            use_auth_token=hf_token
-                        ).to(device)
-                        logger.debug("Loaded TencentARC/flux-mini with DiffusionPipeline")
-                    except Exception as e:
-                        logger.warning(f"DiffusionPipeline failed: {str(e)}. Falling back to manual component loading.")
-                        self.update_status("Warning: Falling back to manual component loading for flux-mini.")
-                        
-                        # Manual component loading for flux-mini
-                        # Load config from FLUX.1-dev since flux-mini lacks it
-                        transformer_config = FluxTransformer2DModel.from_pretrained(
-                            "black-forest-labs/FLUX.1-dev",
-                            subfolder="transformer",
-                            torch_dtype=torch_dtype,
-                            use_auth_token=hf_token,
-                            only_config=True  # Hypothetical argument; we'll load weights separately
-                        ).config
-                        transformer = FluxTransformer2DModel.from_config(transformer_config).to(device)
-                        # Load weights from flux-mini
-                        transformer.load_state_dict(
-                            torch.load(
-                                hf_hub_download(
-                                    "TencentARC/flux-mini",
-                                    "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
-                                    token=hf_token
-                                ),
-                                map_location=device
-                            ),
-                            strict=False
-                        )
-                        transformer.load_state_dict(
-                            torch.load(
-                                hf_hub_download(
-                                    "TencentARC/flux-mini",
-                                    "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
-                                    token=hf_token
-                                ),
-                                map_location=device
-                            ),
-                            strict=False
-                        )
-                        vae = AutoencoderKL.from_pretrained(
-                            "black-forest-labs/FLUX.1-dev",
-                            subfolder="vae",
-                            torch_dtype=torch_dtype,
-                            use_auth_token=hf_token
-                        ).to(device)
-                        tokenizer = CLIPTokenizer.from_pretrained(
-                            "black-forest-labs/FLUX.1-dev",
-                            subfolder="tokenizer",
-                            use_auth_token=hf_token
-                        )
-                        pipe = FluxPipeline(
-                            transformer=transformer,
-                            vae=vae,
-                            tokenizer=tokenizer,
-                            scheduler=scheduler_config,
-                        ).to(device)
-                        logger.debug("Manually loaded flux-mini components with weights from TencentARC/flux-mini")
-                    
-                    if selected_models and selected_models[0] == "Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro":
-                        self.update_status("Warning: ControlNet compatibility with flux-mini unverified.")
-                        pipe.load_lora_weights("Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro", use_auth_token=hf_token)
-                else:
-                    if selected_models and selected_models[0] != "Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro":
-                        adapter = T2IAdapter.from_pretrained(
-                            selected_models[0],
-                            torch_dtype=torch_dtype,
-                            variant="fp16",
-                            use_auth_token=hf_token
-                        ).to(device)
-                        for param in adapter.parameters():
-                            param.requires_grad = False
-                        pipe = StableDiffusionXLPipeline.from_pretrained(
-                            self.model_combo.currentText(),
-                            adapter=adapter,
-                            torch_dtype=torch_dtype,
-                            variant="fp16",
-                            use_safetensors=True,
-                            use_auth_token=hf_token
-                        ).to(device)
-                    else:
-                        pipe = StableDiffusionXLPipeline.from_pretrained(
-                            self.model_combo.currentText(),
-                            torch_dtype=torch_dtype,
-                            variant="fp16",
-                            use_safetensors=True,
-                            use_auth_token=hf_token
-                        ).to(device)
-                
-                if lora_enabled and (not is_flux_model or selected_models[0] != "Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro"):
-                    self.update_status("Loading LoRA weights...")
-                    pipe, lora_scale = load_lora_weights(pipe, self.lora_path.text(), self.lora_scale.value())
-                
-                if ti_enabled and not is_flux_model:
-                    ti_token = self.ti_token.text()
-                    self.update_status("Applying Textual Inversion...")
-                    logger.debug(f"Applying Textual Inversion with token {ti_token}")
-                    if not os.path.isfile(ti_token):
-                        valid_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.")
-                        if (not ti_token or any(c not in valid_chars for c in ti_token) or 
-                            ti_token.startswith(('-', '.')) or ti_token.endswith(('-', '.')) or len(ti_token) > 96):
-                            raise ValueError(f"Invalid Textual Inversion token '{ti_token}'.")
-                    pipe.load_textual_inversion(ti_token)
-                
-                if not is_flux_model:
-                    pipe.scheduler = scheduler_config.from_config(pipe.scheduler.config)
-                pipe = optimize_pipeline(pipe)
-                
-                if self.keep_models_loaded_checkbox.isChecked():
-                    self.cached_pipe = pipe
-                    self.cached_model_name = self.model_combo.currentText()
-                    self.cached_adapters = selected_models
-                    self.cached_lora_path = self.lora_path.text() if lora_enabled and not is_flux_model else ""
-                    self.cached_lora_scale = self.lora_scale.value() if lora_enabled and not is_flux_model else 1.0
-                    self.cached_ti_token = self.ti_token.text() if ti_enabled and not is_flux_model else ""
-                    logger.debug(f"Cached model {self.cached_model_name}")
-            else:
-                self.update_status("Reusing loaded model...")
+            device = "cpu" if self.use_cpu_only else "cuda"
+            hf_token = self.huggingface_token if self.huggingface_token else None
+            torch_dtype = torch.float16
+            key = self.get_pipeline_key()
+            if self.keep_models_loaded_checkbox.isChecked() and self.cached_pipe is not None and self.cached_config == key:
                 pipe = self.cached_pipe
-                scheduler_name = self.scheduler_combo.currentText()
-                scheduler_config = self.get_scheduler_config(scheduler_name)
-                pipe.scheduler = scheduler_config.from_config(pipe.scheduler.config)
-                lora_scale = self.cached_lora_scale
-            model_time = time.time() - model_start
-            logger.debug(f"Model loading/checking time: {model_time:.2f} seconds")
-    
-            gen_start = time.time()
-            use_cuda_graph = not selected_models and not self.use_cpu_only
-            if is_flux_model:
-                generation_args = {
-                    "prompt": self.prompt_input.toPlainText(),
-                    "height": self.height_spin.value(),
-                    "width": self.width_spin.value(),
-                    "guidance_scale": self.guidance_scale.value() if self.guidance_scale.value() != 7.5 else 3.5,
-                    "num_inference_steps": self.num_steps.value() if self.num_steps.value() != 20 else 25,
-                    "max_sequence_length": 512,
-                }
-                if self.seed_input.value() != -1:
-                    generation_args["generator"] = torch.Generator("cuda" if not self.use_cpu_only else "cpu").manual_seed(self.seed_input.value())
+                self.status_signal.emit("Using cached pipeline.")
             else:
-                generation_args = {
-                    "prompt": self.prompt_input.toPlainText(),
-                    "negative_prompt": self.negative_prompt.toPlainText(),
-                    "height": self.height_spin.value(),
-                    "width": self.width_spin.value(),
-                    "guidance_scale": self.guidance_scale.value(),
-                    "num_inference_steps": self.num_steps.value(),
-                    "callback": self.progress_callback,
-                    "callback_steps": 1,
-                }
-                if ti_enabled:
-                    generation_args["prompt"] = f"{self.ti_token.text()} {generation_args['prompt']}"
-                if lora_enabled:
-                    generation_args["cross_attention_kwargs"] = {"scale": lora_scale}
-                if self.model_combo.currentText() == "lykon/dreamshaper-xl-lightning":
-                    generation_args["guidance_scale"] = 2
-                    generation_args["num_inference_steps"] = 4
+                if selected_models:
+                    adapter = T2IAdapter.from_pretrained(
+                        selected_models[0],
+                        torch_dtype=torch_dtype,
+                        variant="fp16",
+                        use_auth_token=hf_token
+                    ).to(device)
+                    for param in adapter.parameters():
+                        param.requires_grad = False
+                    pipe = StableDiffusionXLAdapterPipeline.from_pretrained(
+                        self.model_combo.currentText(),
+                        adapter=adapter,
+                        torch_dtype=torch_dtype,
+                        variant="fp16",
+                        use_safetensors=True,
+                        use_auth_token=hf_token
+                    ).to(device)
                 else:
-                    generation_args["strength"] = self.strength.value() if cond_img else 1.0
-                if self.seed_input.value() != -1:
-                    generation_args["generator"] = torch.Generator("cuda" if not self.use_cpu_only else "cpu").manual_seed(self.seed_input.value())
-                if selected_models and selected_models[0] != "Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro":
-                    generation_args["adapter_conditioning_scale"] = self.adapter_scale.value()
-                    generation_args["image"] = cond_img
-            
-            logger.debug(f"Generating with args: {generation_args}")
-            if use_cuda_graph and hasattr(pipe, 'enable_sequential_cpu_offload'):
-                with torch.cuda.amp.autocast():
-                    result = pipe(**generation_args)
+                    pipe = StableDiffusionXLPipeline.from_pretrained(
+                        self.model_combo.currentText(),
+                        torch_dtype=torch_dtype,
+                        variant="fp16",
+                        use_safetensors=True,
+                        use_auth_token=hf_token
+                    ).to(device)
+            if lora_enabled:
+                self.status_signal.emit("Loading LoRA weights...")
+                pipe, lora_scale = load_lora_weights(pipe, self.lora_path.text(), lora_scale, hf_token)
+            scheduler_name = self.scheduler_combo.currentText()
+            scheduler_config = self.get_scheduler_config(scheduler_name)
+            pipe.scheduler = scheduler_config.from_config(pipe.scheduler.config)
+            pipe = optimize_pipeline(pipe)
+            if self.keep_models_loaded_checkbox.isChecked():
+                self.cached_pipe = pipe
+                self.cached_config = key
             else:
-                with torch.inference_mode():
-                    result = pipe(**generation_args)
-            gen_time = time.time() - gen_start
-            logger.debug(f"Generation time: {gen_time:.2f} seconds")
-    
-            post_start = time.time()
+                self.cached_pipe = None
+                self.cached_config = None
+            generation_args = {
+                "prompt": self.prompt_input.toPlainText(),
+                "negative_prompt": self.negative_prompt.toPlainText(),
+                "height": self.height_spin.value(),
+                "width": self.width_spin.value(),
+                "guidance_scale": self.guidance_scale.value(),
+                "num_inference_steps": self.num_steps.value(),
+                "callback": self.progress_callback,
+                "callback_steps": 1,
+            }
+            if not selected_models:
+                generation_args["strength"] = self.strength.value() if cond_img else 1.0
+            if self.seed_input.value() != -1:
+                generation_args["generator"] = torch.Generator(device).manual_seed(self.seed_input.value())
+            if selected_models:
+                generation_args["adapter_conditioning_scale"] = self.adapter_scale.value()
+                generation_args["image"] = cond_img
+            self.status_signal.emit("Generating image...")
+            self.progress_bar.setVisible(True)
+            with torch.inference_mode():
+                result = pipe(**generation_args)
             elapsed_time = time.time() - start_time
             if not self.cancel_flag and result.images:
                 final_image = result.images[0]
                 pixmap = self.pil_image_to_pixmap(final_image)
                 self.output_preview_signal.emit(pixmap)
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                output_path = os.path.join(output_dir, f"generated_{timestamp}.png")
-                final_image.save(output_path)
-                seed_info = f" (Seed: {self.seed_input.value()})" if self.seed_input.value() != -1 else ""
-                self.update_status(f"Image saved: {output_path}{seed_info} | Generation took {elapsed_time:.2f} seconds")
-                self.display_signal.emit(pixmap)
-                history_entry = f"{timestamp} - {output_path} - Seed: {self.seed_input.value()}"
-                self.history.append(history_entry)
-                self.history_list.addItem(history_entry)
-            post_time = time.time() - post_start
-            logger.debug(f"Post-processing time: {post_time:.2f} seconds")
-        
+                base_path = os.path.join(output_dir, f"generated_{timestamp}.png")
+                final_image.save(base_path)
+                if self.maps_checkbox.isChecked():
+                    bump_map = self.create_bump_map(final_image)
+                    specular_map = self.create_specular_map(final_image)
+                    roughness_map = self.create_roughness_map(final_image)
+                    displacement_map = self.create_displacement_map(final_image)
+                    bump_path = os.path.join(output_dir, f"generated_bump_{timestamp}.png")
+                    specular_path = os.path.join(output_dir, f"generated_specular_{timestamp}.png")
+                    roughness_path = os.path.join(output_dir, f"generated_roughness_{timestamp}.png")
+                    displacement_path = os.path.join(output_dir, f"generated_displacement_{timestamp}.png")
+                    bump_map.save(bump_path)
+                    specular_map.save(specular_path)
+                    roughness_map.save(roughness_path)
+                    displacement_map.save(displacement_path)
+                    self.bump_preview.setPixmap(self.pil_image_to_pixmap(bump_map.convert("RGB")))
+                    self.specular_preview.setPixmap(self.pil_image_to_pixmap(specular_map.convert("RGB")))
+                    self.roughness_preview.setPixmap(self.pil_image_to_pixmap(roughness_map.convert("RGB")))
+                    self.displacement_preview.setPixmap(self.pil_image_to_pixmap(displacement_map.convert("RGB")))
+                    self.status_signal.emit(
+                        f"Base image saved: {base_path} | "
+                        f"Bump: {bump_path}, Specular: {specular_path}, "
+                        f"Roughness: {roughness_path}, Displacement: {displacement_path} | "
+                        f"Took {elapsed_time:.2f} seconds"
+                    )
+                    self.create_principled_shader(base_path, bump_path, specular_path, roughness_path, displacement_path)
+                else:
+                    self.status_signal.emit(f"Base image saved: {base_path} | Took {elapsed_time:.2f} seconds")
+                self.history.append(f"{timestamp} - {base_path} - Seed: {self.seed_input.value()}")
+                self.history_signal.emit(f"{timestamp} - {base_path} - Seed: {self.seed_input.value()}")
         except torch.cuda.OutOfMemoryError as e:
-            logger.error(f"CUDA out of memory: {str(e)}")
-            self.update_status("GPU memory exceeded. Try lower resolution, fewer steps, or CPU-only mode.")
+            self.status_signal.emit("GPU memory exceeded. Try lower resolution, fewer steps, or CPU-only mode.")
         except Exception as e:
-            logger.error(f"Generation error: {str(e)}")
-            self.update_status(f"Error: {str(e)}")
+            self.status_signal.emit(f"Error: {str(e)}")
         finally:
-            if not self.keep_models_loaded_checkbox.isChecked() and pipe is not None:
-                del pipe
-                self.cached_pipe = None
-                self.cached_model_name = ""
-                self.cached_adapters = []
-                self.cached_lora_path = ""
-                self.cached_lora_scale = 1.0
-                self.cached_ti_token = ""
-                torch.cuda.empty_cache()
             self.enable_render_signal.emit(True)
             self.enable_cancel_signal.emit(False)
-            self.show_progress_signal.emit(False)
-
-
-
-    def _show_display(self, pixmap):
-        display_window = QtWidgets.QMainWindow()
-        display_window.setWindowTitle("Generated Display")
-        label = QtWidgets.QLabel()
-        label.setAlignment(QtCore.Qt.AlignCenter)
-        label.setPixmap(pixmap)
-        display_window.setCentralWidget(label)
-        display_window.resize(pixmap.size())
-        display_window.show()
-        self.display_window = display_window
-
-    def update_input_preview(self, pixmap):
-        self.input_preview.setPixmap(pixmap)
-
-    def update_output_preview(self, pixmap):
-        self.output_preview.setPixmap(pixmap)
+            self.progress_bar.setVisible(False)
 
     def update_progress_bar(self, value):
         self.progress_bar.setValue(value)
 
     def update_status(self, text):
         self.status_label.setText(text)
+        self.log_widget.appendPlainText(text)
         logger.info(f"Status updated: {text}")
 
     def set_render_enabled(self, enabled):
@@ -840,9 +698,6 @@ class SDXLPanel(QtWidgets.QWidget):
 
     def set_cancel_enabled(self, enabled):
         self.cancel_btn.setEnabled(enabled)
-
-    def set_progress_visible(self, visible):
-        self.progress_bar.setVisible(visible)
 
     def pil_image_to_pixmap(self, pil_image):
         if pil_image.mode != "RGB":
@@ -854,16 +709,20 @@ class SDXLPanel(QtWidgets.QWidget):
     def start_generation(self):
         torch.cuda.empty_cache()
         self.cancel_flag = False
-        self.enable_render_signal.emit(False)
-        self.enable_cancel_signal.emit(True)
-        self.show_progress_signal.emit(True)
+        self.render_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.progress_bar.setVisible(True)
         self.progress_signal.emit(0)
-        self.update_status("Initializing...")
-        QtCore.QTimer.singleShot(0, self.generate_image)
+        self.status_signal.emit("Initializing...")
+        thread = threading.Thread(target=self.threaded_generation)
+        thread.start()
+
+    def threaded_generation(self):
+        self.generate_image()
 
     def cancel_generation(self):
         self.cancel_flag = True
-        self.update_status("Canceling...")
+        self.status_signal.emit("Canceling...")
 
     def capture_viewport(self, output_dir):
         try:
@@ -875,21 +734,21 @@ class SDXLPanel(QtWidgets.QWidget):
                         scene_viewer = pane_tab
                         break
             if scene_viewer is None:
-                self.update_status("No scene viewer found!")
+                self.status_signal.emit("No scene viewer found!")
                 return None
             viewport = scene_viewer.curViewport()
             timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
             filename = os.path.join(output_dir, f"viewport_{timestamp}.jpg")
             try:
-                self.update_status("Capturing viewport using viewwrite...")
+                self.status_signal.emit("Capturing viewport using viewwrite...")
                 camera_path = f"{cur_desktop.name()}.{scene_viewer.name()}.world.{viewport.name()}"
                 frame = hou.frame()
                 hou.hscript(f'viewwrite -r 512 512 -f {frame} {frame} {camera_path} "{filename}"')
-            except:
-                self.update_status("Trying alternate capture method...")
+            except Exception as e:
+                self.status_signal.emit("Trying alternate capture method...")
                 viewport.saveFrame(filename)
             if os.path.exists(filename):
-                self.update_status("Loading captured image...")
+                self.status_signal.emit("Loading captured image...")
                 image = Image.open(filename)
                 if image.mode != 'RGB':
                     image = image.convert('RGB')
@@ -897,12 +756,18 @@ class SDXLPanel(QtWidgets.QWidget):
                     image = image.resize((512, 512), Image.Resampling.LANCZOS)
                 return image
             else:
-                self.update_status("Failed to save viewport image!")
+                self.status_signal.emit("Failed to save viewport image!")
                 return None
         except Exception as e:
             logger.error(f"Viewport capture error: {str(e)}")
-            self.update_status(f"Viewport capture error: {str(e)}")
+            self.status_signal.emit(f"Viewport capture error: {str(e)}")
             return None
+
+    def get_selected_adapter_models(self):
+        selected = [model for model, checkbox in self.adapter_checkboxes.items() if checkbox.isChecked()]
+        if len(selected) > 1:
+            raise ValueError("Only one control model can be selected at a time.")
+        return selected
 
     def get_scheduler_config(self, scheduler_name):
         scheduler_map = {
@@ -934,8 +799,7 @@ class SDXLPanel(QtWidgets.QWidget):
             "keep_models_loaded": self.keep_models_loaded_checkbox.isChecked(),
             "lora_enabled": self.lora_group.isChecked(),
             "lora_path": self.lora_path.text(),
-            "lora_scale": self.lora_scale.value(),
-            "ti_token": self.ti_token.text()
+            "lora_scale": self.lora_scale.value()
         }
         name, ok = QtWidgets.QInputDialog.getText(self, "Save Preset", "Preset Name:")
         if ok and name:
@@ -945,12 +809,12 @@ class SDXLPanel(QtWidgets.QWidget):
             file_path = os.path.join(presets_dir, f"{name}.json")
             with open(file_path, "w") as f:
                 json.dump(preset, f)
-            self.update_status(f"Preset '{name}' saved.")
+            self.status_signal.emit(f"Preset '{name}' saved.")
 
     def load_preset(self):
         presets_dir = os.path.join(os.getcwd(), "presets")
         if not os.path.exists(presets_dir):
-            self.update_status("No presets found.")
+            self.status_signal.emit("No presets found.")
             return
         file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Preset", presets_dir, "JSON Files (*.json)")
         if file_path:
@@ -964,7 +828,7 @@ class SDXLPanel(QtWidgets.QWidget):
                 self.model_combo.setCurrentIndex(index)
             adapter_models = preset.get("adapter_models", [])
             if len(adapter_models) > 1:
-                self.update_status("Warning: Preset contains multiple adapters; only the first will be used.")
+                self.status_signal.emit("Warning: Preset contains multiple adapters; only the first will be used.")
                 adapter_models = [adapter_models[0]]
             for model, checkbox in self.adapter_checkboxes.items():
                 checkbox.setChecked(model in adapter_models)
@@ -984,8 +848,7 @@ class SDXLPanel(QtWidgets.QWidget):
             self.lora_group.setChecked(preset.get("lora_enabled", False))
             self.lora_path.setText(preset.get("lora_path", ""))
             self.lora_scale.setValue(preset.get("lora_scale", 0.7))
-            self.ti_token.setText(preset.get("ti_token", ""))
-            self.update_status("Preset loaded.")
+            self.status_signal.emit("Preset loaded.")
 
     def load_renderer_preset(self):
         preset = {
@@ -1005,8 +868,7 @@ class SDXLPanel(QtWidgets.QWidget):
             "keep_models_loaded": True,
             "lora_enabled": False,
             "lora_path": "",
-            "lora_scale": 0.7,
-            "ti_token": ""
+            "lora_scale": 0.7
         }
         self.prompt_input.setPlainText(preset["prompt"])
         self.negative_prompt.setPlainText(preset["negative_prompt"])
@@ -1030,14 +892,40 @@ class SDXLPanel(QtWidgets.QWidget):
         self.lora_group.setChecked(preset["lora_enabled"])
         self.lora_path.setText(preset["lora_path"])
         self.lora_scale.setValue(preset["lora_scale"])
-        self.ti_token.setText(preset["ti_token"])
-        self.update_status("Renderer preset loaded.")
+        self.status_signal.emit("Renderer preset loaded.")
+
+    def open_settings(self):
+        token, ok = QtWidgets.QInputDialog.getText(self, "Settings", "Hugging Face Token:")
+        if ok and token:
+            self.huggingface_token = token
+            login(token=self.huggingface_token)
+            self.status_signal.emit("Settings updated and logged in to Hugging Face.")
+
+    def open_model_manager(self):
+        manager = ModelManager(self, self.huggingface_token)
+        manager.exec_()
+
+    def browse_output(self):
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Output Directory", self.output_dir.text())
+        if directory:
+            self.output_dir.setText(directory)
+
+    def browse_lora(self):
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select LoRA Weights", "", "LoRA Files (*.safetensors *.pt *.bin)")
+        if file_path:
+            self.lora_path.setText(file_path)
+            logger.debug(f"Selected LoRA file: {file_path}")
+
+    def toggle_cpu_only(self):
+        self.use_cpu_only = not self.use_cpu_only
+        self.status_signal.emit(f"CPU-only mode: {'Enabled' if self.use_cpu_only else 'Disabled'}")
+        logger.info(f"CPU-only mode toggled to: {self.use_cpu_only}")
 
     def setup_performance_monitoring(self):
         if pynvml:
             try:
                 self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            except:
+            except Exception as e:
                 self.gpu_handle = None
         self.perf_timer = QtCore.QTimer()
         self.perf_timer.timeout.connect(self.update_performance_metrics)
@@ -1053,19 +941,9 @@ class SDXLPanel(QtWidgets.QWidget):
                 text = f"GPU Utilization: {util.gpu}% | Memory: {used_mb}MB / {total_mb}MB"
             except Exception as e:
                 text = f"Error: {e}"
-            self.performance_label.setText(text)
+            self.status_label.setText(text)
         else:
-            self.performance_label.setText("GPU: N/A")
-
-def optimize_pipeline(pipe):
-    pipe.enable_xformers_memory_efficient_attention()
-    pipe.enable_model_cpu_offload()
-    pipe.enable_attention_slicing(slice_size="auto")
-    pipe.enable_vae_tiling()
-    pipe.enable_vae_slicing()
-    if hasattr(pipe, 'vae') and callable(getattr(pipe.vae, 'enable_forward_chunking', None)):
-        pipe.vae.enable_forward_chunking()
-    return pipe
+            self.status_label.setText("GPU: N/A")
 
 def onCreateInterface():
     return SDXLPanel()
