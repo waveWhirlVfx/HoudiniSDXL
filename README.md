@@ -2,7 +2,8 @@
 
 A powerful generative AI panel integrated directly into Houdini, enabling seamless image generation using Stable Diffusion XL (SDXL), with advanced support for LoRA models, control adapters, image-to-image workflows, and more.
 
-![SDXL](https://github.com/user-attachments/assets/ca378d0c-67dc-4fdb-9551-f3844729a960)
+![SDXL](https://github.com/user-attachments/assets/3bbd6b07-2ab4-4ffc-a168-b097ab38827f)
+
 
 
 ## Features
