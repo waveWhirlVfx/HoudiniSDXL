@@ -30,7 +30,7 @@ A powerful generative AI panel integrated directly into Houdini, enabling seamle
 1. Clone or download this repository into your Houdini preferences/scripts/python_panels directory:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/houdini-sdxl-panel.git
+git clone https://github.com/waveWhirlVfx/houdini-sdxl-panel.git
 ```
 
 2. Install Python requirements into your Houdini Python environment:
